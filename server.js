@@ -2,7 +2,7 @@ const express = require("express");
 const mysql = require("mysql2/promise");
 const cors = require("cors");
 
-require("dotenv").config(); // lokalnie (na hostingu ENV i tak działa)
+
 
 const app = express();
 app.use(cors());
