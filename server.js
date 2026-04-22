@@ -1,106 +1,155 @@
-const express = require("express");
-const mysql = require("mysql2/promise");
-const cors = require("cors");
+// 🧾 POST order
+app.post("/api/orders", async (req, res) => {
+    const { customer, summary, items, discount } = req.body;
 
-
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// 🔌 pool połączeń (DUŻO lepsze niż createConnection)
-const db = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    port: process.env.DB_PORT || 3306,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
-
-// 📦 GET produkty
-app.get("/api/products", async (req, res) => {
-    try {
-        const [rows] = await db.query("SELECT * FROM products");
-        res.json(rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Błąd serwera" });
-    }
-});
-
-// 🔐 POST login
-app.post("/api/login", async (req, res) => {
-    const { username, password } = req.body;
-
-    try {
-        const [rows] = await db.query(
-            "SELECT * FROM users WHERE username=? AND password=?",
-            [username, password]
-        );
-
-        res.json({ success: rows.length > 0 });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Błąd serwera" });
-    }
-});
-
-// 📉 PATCH stock
-app.patch("/api/products/:id/stock", async (req, res) => {
-    const productId = parseInt(req.params.id);
-    const { quantity } = req.body;
-
-    // ✅ poprawiona walidacja
-    if (!productId || quantity === undefined || quantity <= 0) {
-        return res.status(400).json({ message: "Nieprawidłowe dane." });
+    if (!customer || !summary || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ message: "Brak danych zamówienia." });
     }
 
+    const {
+        fullName,
+        email,
+        phone,
+        address,
+        city,
+        postalCode,
+        paymentMethod,
+        notes
+    } = customer;
+
+    if (
+        !fullName ||
+        !email ||
+        !phone ||
+        !address ||
+        !city ||
+        !postalCode ||
+        !paymentMethod
+    ) {
+        return res.status(400).json({ message: "Brak wymaganych danych klienta." });
+    }
+
+    const connection = await db.getConnection();
+
     try {
-        const [rows] = await db.query(
-            "SELECT * FROM products WHERE id=?",
-            [productId]
-        );
+        await connection.beginTransaction();
 
-        const product = rows[0];
+        // 1. Sprawdzenie magazynu dla wszystkich produktów
+        for (const item of items) {
+            const productId = Number(item.productId);
+            const quantity = Number(item.quantity);
 
-        if (!product) {
-            return res.status(404).json({ message: "Produkt nie istnieje." });
+            if (!productId || !quantity || quantity <= 0) {
+                throw new Error("Nieprawidłowe dane produktu w zamówieniu.");
+            }
+
+            const [rows] = await connection.query(
+                "SELECT * FROM products WHERE id=? FOR UPDATE",
+                [productId]
+            );
+
+            const product = rows[0];
+
+            if (!product) {
+                throw new Error(`Produkt o id ${productId} nie istnieje.`);
+            }
+
+            if (product.stock < quantity) {
+                throw new Error(`Brak wystarczającej liczby sztuk produktu: ${product.name}`);
+            }
         }
 
-        if (product.stock < quantity) {
-            return res.status(409).json({
-                message: "Brak wystarczającej liczby sztuk."
-            });
-        }
-
-        const newStock = product.stock - quantity;
-
-        await db.query(
-            "UPDATE products SET stock=? WHERE id=?",
-            [newStock, productId]
+        // 2. Zapis zamówienia głównego
+        const [orderResult] = await connection.query(
+            `
+            INSERT INTO orders (
+                full_name,
+                email,
+                phone,
+                address,
+                city,
+                postal_code,
+                payment_method,
+                notes,
+                discount_code,
+                discount_pct,
+                subtotal,
+                delivery,
+                discount_amount,
+                total,
+                total_qty
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `,
+            [
+                fullName,
+                email,
+                phone,
+                address,
+                city,
+                postalCode,
+                paymentMethod,
+                notes || null,
+                discount?.code || null,
+                Number(discount?.pct || 0),
+                Number(summary.subtotal || 0),
+                Number(summary.delivery || 0),
+                Number(summary.discountAmount || 0),
+                Number(summary.total || 0),
+                Number(summary.totalQty || 0)
+            ]
         );
 
-        res.json({
-            id: productId,
-            stock: newStock
+        const orderId = orderResult.insertId;
+
+        // 3. Zapis produktów w zamówieniu + aktualizacja magazynu
+        for (const item of items) {
+            const productId = Number(item.productId);
+            const quantity = Number(item.quantity);
+            const unitPrice = Number(item.unitPrice || 0);
+            const lineTotal = Number(item.lineTotal || 0);
+
+            await connection.query(
+                `
+                INSERT INTO order_items (
+                    order_id,
+                    product_id,
+                    product_name,
+                    category,
+                    unit_price,
+                    quantity,
+                    line_total
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                `,
+                [
+                    orderId,
+                    productId,
+                    item.name,
+                    item.category,
+                    unitPrice,
+                    quantity,
+                    lineTotal
+                ]
+            );
+
+            await connection.query(
+                "UPDATE products SET stock = stock - ? WHERE id = ?",
+                [quantity, productId]
+            );
+        }
+
+        await connection.commit();
+
+        res.status(201).json({
+            success: true,
+            orderId
         });
-
     } catch (err) {
+        await connection.rollback();
         console.error(err);
-        res.status(500).json({ error: "Błąd serwera" });
+        res.status(500).json({
+            message: err.message || "Nie udało się zapisać zamówienia."
+        });
+    } finally {
+        connection.release();
     }
-});
-
-// ❤️ test endpoint
-app.get("/", (req, res) => {
-    res.send("API działa 🚀");
-});
-
-// 🚀 start
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log("Server działa na porcie", PORT);
 });
